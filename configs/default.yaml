@@ -1,7 +1,3 @@
-# Default JFO configuration. Every value here is also a built-in default, so
-# the CLI works without this file. Pass it with --config to keep one source of
-# truth, or omit it and override single values on the command line.
-
 collect:
   model_path: Qwen/Qwen2.5-0.5B-Instruct
   dataset: ise-uiuc/Magicoder-OSS-Instruct-75K

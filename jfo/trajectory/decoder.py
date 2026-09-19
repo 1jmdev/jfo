@@ -98,13 +98,13 @@ class JacobiDecoder:
 
     def _sample_draft(self, count: int, context_ids: torch.Tensor, device: torch.device) -> torch.Tensor:
         if count <= 0:
-            return torch.empty(0, dtype=torch.long, device=device)
+            return torch.empty(1, 0, dtype=torch.long, device=device)
         generator = self._generator(device)
         if self.draft_source == "context" and context_ids.numel() > 0:
             pool = context_ids.reshape(-1)
             positions = torch.randint(0, pool.numel(), (count,), device=device, generator=generator)
-            return pool[positions]
-        return torch.randint(0, self.vocab_size, (count,), device=device, generator=generator)
+            return pool[positions].reshape(1, -1)
+        return torch.randint(0, self.vocab_size, (1, count), device=device, generator=generator)
 
     def prefill(self, prompt_ids: torch.Tensor, cache) -> torch.Tensor:
         logits = self._forward(prompt_ids, cache)
@@ -154,7 +154,11 @@ class JacobiDecoder:
             if num_accepted < draft.shape[1]:
                 self._truncate_cache(cache, cache_length_before + num_accepted)
                 next_token = torch.argmax(probabilities[:, num_accepted - 1, :], dim=-1, keepdim=True)
-                remainder = torch.argmax(probabilities[:, num_accepted:-1, :], dim=-1)
+                remainder_logits = probabilities[:, num_accepted:-1, :]
+                if remainder_logits.shape[1] > 0:
+                    remainder = torch.argmax(remainder_logits, dim=-1)
+                else:
+                    remainder = torch.empty(1, 0, dtype=torch.long, device=device)
                 draft = torch.cat([next_token, remainder], dim=-1)
                 states.append(torch.cat([accepted[:, :total_accepted], draft], dim=-1))
             else:
