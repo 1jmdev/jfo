@@ -11,12 +11,18 @@ from pathlib import Path
 from typing import Dict, Iterator, List, Optional, Tuple
 
 import torch
-from tqdm import tqdm
 
 from ..config import CollectConfig
 from ..precision import resolve_dtype
+from ..progress import progress
+from ..runtime import configure_accelerator, resolve_attention
 from .batched_decoder import BatchedJacobiDecoder
 from .decoder import BlockTrajectory
+
+try:  # optional fast serializer
+    import orjson
+except ImportError:  # pragma: no cover
+    orjson = None
 
 _PROMPT_FIELDS = ("prompt", "problem", "question", "input", "instruction", "query", "text")
 
@@ -25,10 +31,11 @@ def load_model(model_path: str, dtype: torch.dtype, attention: str, device: torc
     """Load a causal language model and tokenizer for inference."""
     from transformers import AutoModelForCausalLM, AutoTokenizer
 
+    configure_accelerator()
     model = AutoModelForCausalLM.from_pretrained(
         model_path,
         torch_dtype=dtype,
-        attn_implementation=attention,
+        attn_implementation=resolve_attention(attention),
         device_map={"": device},
     )
     model.eval()
@@ -100,11 +107,22 @@ def load_prompt_stream(
 
 def block_record(block: BlockTrajectory) -> Dict:
     """Serialize a block trajectory into JSON-friendly primitives."""
+    states = block.states
+    if isinstance(states, torch.Tensor):
+        state_list = states.reshape(states.shape[0], -1).tolist()
+    else:
+        state_list = [state.reshape(-1).tolist() for state in states]
     return {
-        "states": [state.reshape(-1).tolist() for state in block.states],
+        "states": state_list,
         "fixed_point": block.fixed_point.reshape(-1).tolist(),
         "iterations": block.iterations,
     }
+
+
+def _encode_record(record: Dict) -> bytes:
+    if orjson is not None:
+        return orjson.dumps(record) + b"\n"
+    return (json.dumps(record, ensure_ascii=False) + "\n").encode("utf-8")
 
 
 def _flush_batch(
@@ -113,20 +131,22 @@ def _flush_batch(
     block_size: int,
     config: CollectConfig,
     handle,
-    progress: tqdm,
+    bar,
 ) -> int:
     """Decode a length-sorted buffer in batches and write one record per prompt."""
     batch_size = max(1, config.batch_size)
     buffer.sort(key=lambda item: item[1].numel())
+    device = next(decoder.model.parameters()).device
     written = 0
     for start in range(0, len(buffer), batch_size):
         chunk = buffer[start : start + batch_size]
         decoder.reseed(config.seed + chunk[0][0])
         trajectories = decoder.decode(
-            [item[1] for item in chunk],
+            [item[1].to(device, non_blocking=True) for item in chunk],
             block_size=block_size,
             max_new_tokens=config.max_new_tokens,
         )
+        payload = bytearray()
         for (prompt_id, prompt_ids), trajectory in zip(chunk, trajectories):
             record = {
                 "prompt_id": prompt_id,
@@ -134,10 +154,11 @@ def _flush_batch(
                 "prompt_ids": prompt_ids.tolist(),
                 "blocks": [block_record(block) for block in trajectory.blocks],
             }
-            handle.write(json.dumps(record, ensure_ascii=False))
-            handle.write("\n")
+            payload.extend(_encode_record(record))
             written += 1
-            progress.update(1)
+        handle.write(payload)
+        handle.flush()
+        bar.update(len(chunk))
     return written
 
 
@@ -163,7 +184,7 @@ def run_collection(config: CollectConfig, device: Optional[torch.device] = None)
 
     buffer_limit = max(1, config.batch_size) * 8
     written = 0
-    with output_path.open("w", encoding="utf-8") as handle:
+    with output_path.open("wb") as handle:
         for block_size in config.block_sizes:
             stream = load_prompt_stream(
                 config.dataset,
@@ -174,7 +195,11 @@ def run_collection(config: CollectConfig, device: Optional[torch.device] = None)
                 config.chat_template,
                 config.max_prompt_tokens,
             )
-            progress = tqdm(desc=f"collect n={block_size}", unit="prompt")
+            bar = progress(
+                total=config.max_prompts if config.max_prompts else None,
+                desc=f"collect n={block_size}",
+                unit="prompt",
+            )
             buffer: List[Tuple[int, torch.Tensor]] = []
             for index, prompt_ids in enumerate(stream):
                 if config.max_prompts and index >= config.max_prompts:
@@ -183,11 +208,10 @@ def run_collection(config: CollectConfig, device: Optional[torch.device] = None)
                     continue
                 buffer.append((index, torch.tensor(prompt_ids, dtype=torch.long)))
                 if len(buffer) >= buffer_limit:
-                    written += _flush_batch(decoder, buffer, int(block_size), config, handle, progress)
+                    written += _flush_batch(decoder, buffer, int(block_size), config, handle, bar)
                     buffer = []
             if buffer:
-                written += _flush_batch(decoder, buffer, int(block_size), config, handle, progress)
-            progress.close()
-            handle.flush()
+                written += _flush_batch(decoder, buffer, int(block_size), config, handle, bar)
+            bar.close()
 
     return written

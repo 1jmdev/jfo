@@ -6,6 +6,8 @@ import torch
 
 from .config import MergeConfig, SubspaceConfig
 from .precision import resolve_dtype
+from .progress import note
+from .runtime import configure_accelerator, resolve_attention
 from .subspace import adapt_model_from_bases, extract_bases, load_subspace_state, merge_subspace
 
 
@@ -16,6 +18,7 @@ def run_merge(config: MergeConfig, device: torch.device = None) -> Path:
 
     from transformers import AutoModelForCausalLM, AutoTokenizer
 
+    configure_accelerator()
     device = device or torch.device("cuda" if torch.cuda.is_available() else "cpu")
     payload = torch.load(Path(config.adapter_path).expanduser(), map_location="cpu", weights_only=False)
     adaptation = SubspaceConfig(**payload["adaptation"])
@@ -24,7 +27,7 @@ def run_merge(config: MergeConfig, device: torch.device = None) -> Path:
     model = AutoModelForCausalLM.from_pretrained(
         config.model_path,
         torch_dtype=resolve_dtype(config.dtype),
-        attn_implementation=config.attention,
+        attn_implementation=resolve_attention(config.attention),
         device_map={"": device},
     )
     adapt_model_from_bases(model, adaptation, extract_bases(state))
@@ -35,5 +38,5 @@ def run_merge(config: MergeConfig, device: torch.device = None) -> Path:
     output_path.mkdir(parents=True, exist_ok=True)
     model.save_pretrained(output_path)
     AutoTokenizer.from_pretrained(config.model_path).save_pretrained(output_path)
-    print(f"merged {merged} projections into {output_path}")
+    note(f"merged {merged} projections into {output_path}")
     return output_path

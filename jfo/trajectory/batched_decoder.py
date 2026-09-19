@@ -6,9 +6,10 @@ uniform across the batch because prompts are left padded. The noisy block slots
 are re-fed every iteration and the cache is cropped back to the prefix, so no
 per-sequence cache surgery is needed and the whole batch shares one forward pass.
 
-The acceptance bookkeeping is fully vectorized. Only ``done.all()`` synchronizes
-the host per iteration, which keeps the accelerator busy instead of stalling on
-per-sequence scalar reads.
+The generation loop is free of host synchronization. Acceptance, rebuild and
+end-of-sequence bookkeeping are vectorized, no early break is taken, and every
+``.tolist()`` is deferred until all blocks have been queued. That keeps the
+accelerator saturated instead of stalling on scalar reads between blocks.
 """
 
 from typing import List, Optional
@@ -101,14 +102,10 @@ class BatchedJacobiDecoder:
         pad_block = torch.full((batch, block_size), self.pad_token_id, dtype=torch.long, device=device)
         prefix_length = prompt_width
         active = torch.ones(batch, dtype=torch.bool, device=device)
-        fixed_chunks: List[List[torch.Tensor]] = [[] for _ in range(batch)]
-        block_records: List[List[BlockTrajectory]] = [[] for _ in range(batch)]
+        stored: List[dict] = []
 
         max_blocks = max(1, max_new_tokens // block_size)
         for block_index in range(max_blocks):
-            if not bool(active.any()):
-                break
-
             draft = pad_block.clone()
             draft[:, 0] = next_tokens
             if block_size > 1:
@@ -123,7 +120,8 @@ class BatchedJacobiDecoder:
             slots_position = lengths[:, None] + block_index * block_size + positions
 
             for _ in range(block_size):
-                counts += (active & ~done).long()
+                updating = active & ~done
+                counts += updating.long()
                 state_stack.append(draft.clone())
 
                 mask = torch.cat(
@@ -145,7 +143,7 @@ class BatchedJacobiDecoder:
                 accepted = (mismatch.cumsum(dim=-1) == 0).sum(dim=-1) + 1
                 accepted = torch.minimum(accepted, torch.full_like(accepted, block_size))
                 accepted = torch.maximum(accepted, total_accepted)
-                accepted = torch.where(active, accepted, total_accepted)
+                accepted = torch.where(updating, accepted, total_accepted)
 
                 fixed = torch.where(positions < accepted[:, None], draft, fixed)
                 total_accepted = accepted
@@ -153,7 +151,7 @@ class BatchedJacobiDecoder:
                 if self.eos_token_id is not None:
                     eos_hit = fixed == self.eos_token_id
                     first_eos = (eos_hit.cumsum(dim=-1) == 0).sum(dim=-1)
-                    newly_eos = active & ~done & (first_eos < block_size)
+                    newly_eos = updating & (first_eos < block_size)
                     total_accepted = torch.where(newly_eos, first_eos + 1, total_accepted)
                     done = done | newly_eos
                     active = active & ~newly_eos
@@ -164,9 +162,6 @@ class BatchedJacobiDecoder:
 
                 shifted = torch.gather(predictions, 1, (positions - 1).clamp(min=0).expand(batch, block_size))
                 draft = torch.where(positions < total_accepted[:, None], fixed, shifted)
-
-                if bool(done.all()):
-                    break
 
             fixed_block = torch.where(positions < total_accepted[:, None], fixed, pad_block)
             append_mask = torch.cat(
@@ -184,41 +179,62 @@ class BatchedJacobiDecoder:
             attention = append_mask
             prefix_length += block_size
 
-            count_list = counts.tolist()
-            accepted_list = total_accepted.tolist()
-            active_list = active.tolist()
-            for index in range(batch):
-                if count_list[index] == 0:
-                    continue
-                states = [state_stack[step][index] for step in range(count_list[index])]
-                length = block_size if accepted_list[index] >= block_size else int(accepted_list[index])
-                fixed_point = fixed[index, :length].clone()
-                block_records[index].append(
-                    BlockTrajectory(
-                        fixed_point=fixed_point,
-                        states=states,
-                        next_token=block_next[index].clone() if active_list[index] else None,
-                        iterations=count_list[index],
-                    )
-                )
-                fixed_chunks[index].append(fixed_point)
+            stored.append(
+                {
+                    "states": torch.stack(state_stack),
+                    "counts": counts,
+                    "fixed": fixed,
+                    "lengths": total_accepted,
+                    "next": block_next,
+                    "active": active,
+                }
+            )
+            next_tokens = torch.where(active, block_next, next_tokens)
 
-            for index in range(batch):
-                if active_list[index]:
-                    next_tokens[index] = block_next[index]
+        cpu_entries = [
+            {
+                "states": entry["states"].cpu(),
+                "counts": entry["counts"].tolist(),
+                "fixed": entry["fixed"].cpu(),
+                "lengths": entry["lengths"].tolist(),
+                "next": entry["next"].cpu(),
+                "active": entry["active"].tolist(),
+            }
+            for entry in stored
+        ]
 
         results: List[PromptTrajectory] = []
         for index in range(batch):
+            blocks: List[BlockTrajectory] = []
+            fixed_points: List[torch.Tensor] = []
+            for entry in cpu_entries:
+                count = entry["counts"][index]
+                if count == 0:
+                    continue
+                length = min(int(entry["lengths"][index]), block_size)
+                fixed_point = entry["fixed"][index, :length].clone()
+                states = entry["states"][:count, index].clone()
+                next_token = entry["next"][index].clone() if entry["active"][index] else None
+                blocks.append(
+                    BlockTrajectory(
+                        fixed_point=fixed_point,
+                        states=states,
+                        next_token=next_token,
+                        iterations=count,
+                    )
+                )
+                fixed_points.append(fixed_point)
+
             generated = (
-                torch.cat(fixed_chunks[index])
-                if fixed_chunks[index]
-                else torch.empty(0, dtype=torch.long, device=device)
+                torch.cat(fixed_points)
+                if fixed_points
+                else torch.empty(0, dtype=torch.long, device=prompts[index].device)
             )
             results.append(
                 PromptTrajectory(
                     prompt_ids=prompts[index].cpu(),
-                    generated_ids=generated.cpu(),
-                    blocks=block_records[index],
+                    generated_ids=generated,
+                    blocks=blocks,
                     block_size=block_size,
                 )
             )

@@ -17,6 +17,12 @@ from typing import Dict, Iterator, List, Optional, Sequence
 import numpy as np
 
 from ..config import PackConfig
+from ..progress import progress
+
+try:  # optional fast serializer
+    import orjson
+except ImportError:  # pragma: no cover
+    orjson = None
 
 
 def noise_schedule(window_size: int, low: float, high: float, strategy: str) -> np.ndarray:
@@ -134,14 +140,18 @@ def run_packing(config: PackConfig) -> int:
     output_path.parent.mkdir(parents=True, exist_ok=True)
 
     written = 0
-    with output_path.open("w", encoding="utf-8") as handle:
-        for record in read_records(config.trajectory_path):
+    with output_path.open("wb") as handle:
+        for record in progress(read_records(config.trajectory_path), desc="pack", unit="record"):
+            payload = bytearray()
             for block_size in config.block_sizes:
                 packed = pack_record(record, int(block_size), config, rng, schedule)
                 if packed is None:
                     continue
-                handle.write(json.dumps(packed, ensure_ascii=False))
-                handle.write("\n")
+                if orjson is not None:
+                    payload.extend(orjson.dumps(packed) + b"\n")
+                else:
+                    payload.extend((json.dumps(packed, ensure_ascii=False) + "\n").encode("utf-8"))
                 written += 1
+            handle.write(payload)
 
     return written

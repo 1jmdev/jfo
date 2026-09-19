@@ -39,9 +39,9 @@ class CollectConfig:
     block_sizes: Sequence[int] = (32,)
     max_new_tokens: int = 512
     max_prompt_tokens: int = 1024
-    batch_size: int = 32
+    batch_size: int = 128
     dtype: str = "bfloat16"
-    attention: str = "sdpa"
+    attention: str = "flash_attention_2"
     draft_source: str = "context"
     chat_template: bool = False
     seed: int = 0
@@ -137,7 +137,7 @@ class MergeConfig:
     adapter_path: str = "runs/jfo_qwen2_5_0_5b/subspace.pt"
     output_path: str = "runs/jfo_qwen2_5_0_5b/merged"
     dtype: str = "bfloat16"
-    attention: str = "sdpa"
+    attention: str = "flash_attention_2"
 
 
 @dataclass
@@ -154,7 +154,7 @@ class ValidateConfig:
     max_prompt_tokens: int = 512
     num_prompts: int = 8
     dtype: str = "bfloat16"
-    attention: str = "sdpa"
+    attention: str = "flash_attention_2"
 
 
 @dataclass

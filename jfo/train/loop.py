@@ -11,6 +11,8 @@ import torch
 
 from ..config import TrainConfig
 from ..precision import resolve_dtype
+from ..progress import note, progress
+from ..runtime import configure_accelerator
 from ..subspace import (
     adapt_model,
     residual_parameters,
@@ -122,6 +124,7 @@ def train(config: TrainConfig, device: torch.device = None) -> Path:
         raise ValueError("model_path and data_path are required")
 
     device = device or torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    configure_accelerator()
     set_seed(config.seed)
 
     tokenizer = load_tokenizer(config.model_path)
@@ -129,8 +132,8 @@ def train(config: TrainConfig, device: torch.device = None) -> Path:
     adapted = configure_model(model, config)
     model.train()
 
-    print(f"adapted projections: {adapted}")
-    print(f"trainable parameters: {trainable_parameter_count(model)}")
+    note(f"adapted projections: {adapted}")
+    note(f"trainable parameters: {trainable_parameter_count(model)}")
 
     _, loader = build_loader(config)
     optimizer = SubspaceAdamW(
@@ -149,10 +152,17 @@ def train(config: TrainConfig, device: torch.device = None) -> Path:
         start_step, optimizer_state = load_checkpoint(checkpoint_path, model)
         if optimizer_state:
             optimizer.load_state_dict(optimizer_state)
-        print(f"resumed from step {start_step}")
+        note(f"resumed from step {start_step}")
 
     iterator = iter(loader)
-    for step in range(start_step, config.max_steps):
+    bar = progress(
+        range(start_step, config.max_steps),
+        desc="train",
+        unit="step",
+        initial=start_step,
+        total=config.max_steps,
+    )
+    for step in bar:
         learning_rate = learning_rate_at(
             step, config.max_steps, config.learning_rate, config.warmup_steps, config.schedule
         )
@@ -181,16 +191,16 @@ def train(config: TrainConfig, device: torch.device = None) -> Path:
 
         if completed % config.log_every == 0 or completed == config.max_steps:
             elapsed = time.time() - started
-            print(
-                f"step {completed}/{config.max_steps} "
-                f"loss {accumulated / config.accumulation:.4f} "
-                f"consistency {consistency_total / config.accumulation:.4f} "
-                f"ar {autoregressive_total / config.accumulation:.4f} "
-                f"lr {learning_rate:.3e} "
-                f"step_time {elapsed:.2f}s"
+            bar.set_postfix(
+                loss=f"{accumulated / config.accumulation:.4f}",
+                cons=f"{consistency_total / config.accumulation:.4f}",
+                ar=f"{autoregressive_total / config.accumulation:.4f}",
+                lr=f"{learning_rate:.2e}",
+                step_time=f"{elapsed:.2f}s",
             )
         if completed % config.save_every == 0 or completed == config.max_steps:
             save_checkpoint(output_dir, model, optimizer, completed, config)
+    bar.close()
 
     torch.save(
         {
@@ -199,5 +209,5 @@ def train(config: TrainConfig, device: torch.device = None) -> Path:
         },
         output_dir / "subspace.pt",
     )
-    print(f"final residuals written to {output_dir / 'subspace.pt'}")
+    note(f"final residuals written to {output_dir / 'subspace.pt'}")
     return output_dir

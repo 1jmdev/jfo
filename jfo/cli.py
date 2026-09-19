@@ -12,6 +12,7 @@ from .config import (
     ValidateConfig,
     load_yaml,
 )
+from .progress import note
 
 
 def _section(config_path: str, name: str) -> Dict[str, Any]:
@@ -64,7 +65,7 @@ def command_collect(args: argparse.Namespace) -> None:
     if args.chat_template:
         mapping["chat_template"] = True
     written = run_collection(_instantiate(CollectConfig, mapping))
-    print(f"collected {written} trajectory records")
+    note(f"collected {written} trajectory records")
 
 
 def command_pack(args: argparse.Namespace) -> None:
@@ -87,7 +88,7 @@ def command_pack(args: argparse.Namespace) -> None:
         )
     )
     written = run_packing(_instantiate(PackConfig, mapping))
-    print(f"packed {written} training sequences")
+    note(f"packed {written} training sequences")
 
 
 def command_train(args: argparse.Namespace) -> None:

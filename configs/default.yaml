@@ -8,9 +8,9 @@ collect:
   block_sizes: [32]
   max_new_tokens: 512
   max_prompt_tokens: 1024
-  batch_size: 32
+  batch_size: 128
   dtype: bfloat16
-  attention: sdpa
+  attention: flash_attention_2
   draft_source: context
   shard_count: 1
 
@@ -53,7 +53,7 @@ merge:
   adapter_path: runs/jfo_qwen2_5_0_5b/subspace.pt
   output_path: runs/jfo_qwen2_5_0_5b/merged
   dtype: bfloat16
-  attention: sdpa
+  attention: flash_attention_2
 
 validate:
   model_path: runs/jfo_qwen2_5_0_5b/merged
@@ -64,4 +64,4 @@ validate:
   max_new_tokens: 256
   num_prompts: 8
   dtype: bfloat16
-  attention: sdpa
+  attention: flash_attention_2

@@ -7,6 +7,7 @@ import torch
 
 from .config import ValidateConfig
 from .precision import resolve_dtype
+from .progress import note, progress
 from .trajectory import JacobiDecoder, load_model, load_prompt_stream
 
 
@@ -32,7 +33,8 @@ def _decode_all(config: ValidateConfig, device: torch.device) -> Dict[str, float
     total_tokens = 0
     total_iterations = 0
     total_seconds = 0.0
-    for index, prompt_ids in enumerate(prompts):
+    bar = progress(prompts, desc="validate", unit="prompt")
+    for index, prompt_ids in enumerate(bar):
         decoder.reseed(index)
         prompt = torch.tensor(prompt_ids, dtype=torch.long, device=device)
         started = time.time()
@@ -41,6 +43,11 @@ def _decode_all(config: ValidateConfig, device: torch.device) -> Dict[str, float
         total_seconds += time.time() - started
         total_tokens += int(trajectory.generated_ids.numel())
         total_iterations += sum(block.iterations for block in trajectory.blocks)
+        bar.set_postfix(
+            tokens=f"{total_tokens}",
+            tpf=f"{total_tokens / max(1, total_iterations):.2f}",
+        )
+    bar.close()
 
     tokens_per_forward = total_tokens / max(1, total_iterations)
     return {
@@ -61,7 +68,7 @@ def run_validation(config: ValidateConfig, device: torch.device = None) -> Dict[
 
     device = device or torch.device("cuda" if torch.cuda.is_available() else "cpu")
     metrics = _decode_all(config, device)
-    print(
+    note(
         f"prompts {metrics['prompts']} "
         f"tokens {metrics['generated_tokens']} "
         f"iterations {metrics['decode_iterations']} "

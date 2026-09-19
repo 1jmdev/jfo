@@ -7,6 +7,7 @@ from torch import nn
 
 from ..config import SubspaceConfig
 from ..precision import resolve_dtype
+from ..progress import progress
 from .layer import SubspaceLinear
 
 Basis = Tuple[torch.Tensor, torch.Tensor]
@@ -71,7 +72,8 @@ def _install(model: nn.Module, config: SubspaceConfig, bases: Dict[str, Basis]) 
 def adapt_model(model: nn.Module, config: SubspaceConfig) -> int:
     """Compute SVD bases for every target projection and install adaptation."""
     bases: Dict[str, Basis] = {}
-    for name, module in _target_linears(model, config):
+    candidates = _target_linears(model, config)
+    for name, module in progress(candidates, desc="svd bases", unit="module"):
         bases[name] = compute_bases(
             module.weight,
             rank=config.rank,
