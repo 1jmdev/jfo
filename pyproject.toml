@@ -1,0 +1,39 @@
+[build-system]
+requires = ["hatchling>=1.25"]
+build-backend = "hatchling.build"
+
+[project]
+name = "jfo"
+version = "0.1.0"
+description = "Sub-hour Jacobi forcing conversion via SVD-aligned subspace correction and mixed block-size distillation"
+readme = "README.md"
+requires-python = ">=3.10"
+license = { text = "Apache-2.0" }
+authors = [{ name = "JFO Contributors" }]
+keywords = ["jacobi-forcing", "parallel-decoding", "consistency-distillation", "low-rank-adaptation"]
+
+dependencies = [
+    "torch>=2.5",
+    "transformers>=4.50",
+    "datasets>=2.20",
+    "safetensors>=0.4",
+    "numpy>=1.26",
+    "PyYAML>=6.0",
+    "tqdm>=4.66",
+]
+
+[project.optional-dependencies]
+flash = ["flash-attn>=2.6"]
+tracking = ["wandb>=0.17"]
+
+[project.scripts]
+jfo = "jfo.cli:main"
+
+[project.urls]
+Paper = "https://arxiv.org/abs/2512.14681"
+
+[tool.hatch.build.targets.wheel]
+packages = ["jfo"]
+
+[tool.hatch.build.targets.sdist]
+include = ["jfo", "configs", "README.md", "pyproject.toml"]

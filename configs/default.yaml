@@ -1,0 +1,70 @@
+# Default JFO configuration. Every value here is also a built-in default, so
+# the CLI works without this file. Pass it with --config to keep one source of
+# truth, or omit it and override single values on the command line.
+
+collect:
+  model_path: Qwen/Qwen2.5-0.5B-Instruct
+  dataset: ise-uiuc/Magicoder-OSS-Instruct-75K
+  dataset_split: train
+  prompt_field: problem
+  max_prompts: 50000
+  output_path: data/trajectories.jsonl
+  block_sizes: [32]
+  max_new_tokens: 512
+  max_prompt_tokens: 1024
+  dtype: bfloat16
+  attention: sdpa
+  draft_source: context
+  shard_count: 1
+
+pack:
+  trajectory_path: data/trajectories.jsonl
+  output_path: data/packed.jsonl
+  block_sizes: [4, 8, 16, 32]
+  window_size: 16
+  schedule: linear_progressive
+  min_noise_ratio: 0.0
+  max_noise_ratio: 1.0
+  max_sequence_length: 2048
+
+subspace:
+  rank: 8
+  target_modules: [q_proj, k_proj, v_proj, o_proj, gate_proj, up_proj, down_proj]
+  svd_niter: 4
+  dtype: bfloat16
+
+train:
+  model_path: Qwen/Qwen2.5-0.5B-Instruct
+  data_path: data/packed.jsonl
+  output_dir: runs/jfo_qwen2_5_0_5b
+  block_sizes: [4, 8, 16, 32]
+  max_steps: 3000
+  learning_rate: 2.0e-4
+  accumulation: 16
+  max_sequence_length: 2048
+  gradient_checkpointing: true
+  stochastic_rounding: true
+  temperature: 1.0
+  ar_weight: 10.0
+  schedule: cosine
+  warmup_steps: 50
+  log_every: 10
+  save_every: 500
+
+merge:
+  model_path: Qwen/Qwen2.5-0.5B-Instruct
+  adapter_path: runs/jfo_qwen2_5_0_5b/subspace.pt
+  output_path: runs/jfo_qwen2_5_0_5b/merged
+  dtype: bfloat16
+  attention: sdpa
+
+validate:
+  model_path: runs/jfo_qwen2_5_0_5b/merged
+  dataset: ise-uiuc/Magicoder-OSS-Instruct-75K
+  dataset_split: train
+  prompt_field: problem
+  block_size: 32
+  max_new_tokens: 256
+  num_prompts: 8
+  dtype: bfloat16
+  attention: sdpa
