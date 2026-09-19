@@ -5,6 +5,10 @@ cache holds only the clean prefix (prompt plus accepted fixed points), which is
 uniform across the batch because prompts are left padded. The noisy block slots
 are re-fed every iteration and the cache is cropped back to the prefix, so no
 per-sequence cache surgery is needed and the whole batch shares one forward pass.
+
+The acceptance bookkeeping is fully vectorized. Only ``done.all()`` synchronizes
+the host per iteration, which keeps the accelerator busy instead of stalling on
+per-sequence scalar reads.
 """
 
 from typing import List, Optional
@@ -93,35 +97,34 @@ class BatchedJacobiDecoder:
         )
         next_tokens = torch.argmax(prefill.logits[:, -1, :], dim=-1)
 
+        positions = torch.arange(block_size, device=device)[None, :]
+        pad_block = torch.full((batch, block_size), self.pad_token_id, dtype=torch.long, device=device)
         prefix_length = prompt_width
         active = torch.ones(batch, dtype=torch.bool, device=device)
         fixed_chunks: List[List[torch.Tensor]] = [[] for _ in range(batch)]
         block_records: List[List[BlockTrajectory]] = [[] for _ in range(batch)]
-        relative_positions = torch.arange(block_size, device=device)
 
         max_blocks = max(1, max_new_tokens // block_size)
         for block_index in range(max_blocks):
             if not bool(active.any()):
                 break
 
-            draft = torch.full((batch, block_size), self.pad_token_id, dtype=torch.long, device=device)
+            draft = pad_block.clone()
             draft[:, 0] = next_tokens
             if block_size > 1:
                 draft[:, 1:] = self._sample_tail(prompts, block_size - 1, device)
 
-            fixed = torch.full((batch, block_size), self.pad_token_id, dtype=torch.long, device=device)
+            fixed = pad_block.clone()
             total_accepted = torch.zeros(batch, dtype=torch.long, device=device)
             done = ~active
             block_next = torch.zeros(batch, dtype=torch.long, device=device)
-            fixed_length = torch.full((batch,), block_size, dtype=torch.long, device=device)
-            states: List[List[torch.Tensor]] = [[] for _ in range(batch)]
-            iterations = [0] * batch
-            slots_position = lengths[:, None] + block_index * block_size + relative_positions[None, :]
+            state_stack: List[torch.Tensor] = []
+            counts = torch.zeros(batch, dtype=torch.long, device=device)
+            slots_position = lengths[:, None] + block_index * block_size + positions
 
             for _ in range(block_size):
-                for index in range(batch):
-                    if bool(active[index]) and not bool(done[index]):
-                        states[index].append(draft[index].clone())
+                counts += (active & ~done).long()
+                state_stack.append(draft.clone())
 
                 mask = torch.cat(
                     [attention, torch.ones((batch, block_size), dtype=torch.long, device=device)],
@@ -141,47 +144,31 @@ class BatchedJacobiDecoder:
                 mismatch = draft[:, 1:] != predictions[:, :-1]
                 accepted = (mismatch.cumsum(dim=-1) == 0).sum(dim=-1) + 1
                 accepted = torch.minimum(accepted, torch.full_like(accepted, block_size))
+                accepted = torch.maximum(accepted, total_accepted)
+                accepted = torch.where(active, accepted, total_accepted)
 
-                for index in range(batch):
-                    if not bool(active[index]) or bool(done[index]):
-                        continue
-                    iterations[index] += 1
-                    count = max(int(accepted[index]), int(total_accepted[index]))
-                    fixed[index, :count] = draft[index, :count]
-                    total_accepted[index] = count
+                fixed = torch.where(positions < accepted[:, None], draft, fixed)
+                total_accepted = accepted
 
-                    if self.eos_token_id is not None:
-                        eos_positions = (fixed[index, :count] == self.eos_token_id).nonzero(as_tuple=False)
-                        if eos_positions.numel() > 0:
-                            stop = int(eos_positions[0].item()) + 1
-                            total_accepted[index] = stop
-                            fixed_length[index] = stop
-                            done[index] = True
-                            active[index] = False
-                            continue
+                if self.eos_token_id is not None:
+                    eos_hit = fixed == self.eos_token_id
+                    first_eos = (eos_hit.cumsum(dim=-1) == 0).sum(dim=-1)
+                    newly_eos = active & ~done & (first_eos < block_size)
+                    total_accepted = torch.where(newly_eos, first_eos + 1, total_accepted)
+                    done = done | newly_eos
+                    active = active & ~newly_eos
 
-                    if count >= block_size:
-                        block_next[index] = int(predictions[index, block_size - 1].item())
-                        done[index] = True
-                        continue
+                complete = (total_accepted >= block_size) & ~done
+                block_next = torch.where(complete, predictions[:, block_size - 1], block_next)
+                done = done | complete
 
-                    corrected = predictions[index, count - 1]
-                    remainder = predictions[index, count : block_size - 1]
-                    draft[index, :count] = fixed[index, :count]
-                    draft[index, count] = corrected
-                    if remainder.numel() > 0:
-                        draft[index, count + 1 : block_size] = remainder
+                shifted = torch.gather(predictions, 1, (positions - 1).clamp(min=0).expand(batch, block_size))
+                draft = torch.where(positions < total_accepted[:, None], fixed, shifted)
 
                 if bool(done.all()):
                     break
 
-            fixed_block = torch.full((batch, block_size), self.pad_token_id, dtype=torch.long, device=device)
-            for index in range(batch):
-                if not bool(active[index]) and fixed_length[index] < block_size:
-                    fixed_block[index, : int(fixed_length[index])] = fixed[index, : int(fixed_length[index])]
-                else:
-                    fixed_block[index] = fixed[index]
-
+            fixed_block = torch.where(positions < total_accepted[:, None], fixed, pad_block)
             append_mask = torch.cat(
                 [attention, torch.ones((batch, block_size), dtype=torch.long, device=device)],
                 dim=-1,
@@ -197,28 +184,36 @@ class BatchedJacobiDecoder:
             attention = append_mask
             prefix_length += block_size
 
+            count_list = counts.tolist()
+            accepted_list = total_accepted.tolist()
+            active_list = active.tolist()
             for index in range(batch):
-                if not states[index]:
+                if count_list[index] == 0:
                     continue
-                length = int(fixed_length[index]) if int(total_accepted[index]) >= block_size else int(total_accepted[index])
+                states = [state_stack[step][index] for step in range(count_list[index])]
+                length = block_size if accepted_list[index] >= block_size else int(accepted_list[index])
                 fixed_point = fixed[index, :length].clone()
                 block_records[index].append(
                     BlockTrajectory(
                         fixed_point=fixed_point,
-                        states=states[index],
-                        next_token=block_next[index].clone() if bool(active[index]) else None,
-                        iterations=iterations[index],
+                        states=states,
+                        next_token=block_next[index].clone() if active_list[index] else None,
+                        iterations=count_list[index],
                     )
                 )
                 fixed_chunks[index].append(fixed_point)
 
             for index in range(batch):
-                if bool(active[index]):
+                if active_list[index]:
                     next_tokens[index] = block_next[index]
 
         results: List[PromptTrajectory] = []
         for index in range(batch):
-            generated = torch.cat(fixed_chunks[index]) if fixed_chunks[index] else torch.empty(0, dtype=torch.long, device=device)
+            generated = (
+                torch.cat(fixed_chunks[index])
+                if fixed_chunks[index]
+                else torch.empty(0, dtype=torch.long, device=device)
+            )
             results.append(
                 PromptTrajectory(
                     prompt_ids=prompts[index].cpu(),
