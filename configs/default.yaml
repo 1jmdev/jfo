@@ -8,6 +8,7 @@ collect:
   block_sizes: [32]
   max_new_tokens: 512
   max_prompt_tokens: 1024
+  batch_size: 32
   dtype: bfloat16
   attention: sdpa
   draft_source: context

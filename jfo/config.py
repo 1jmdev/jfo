@@ -39,7 +39,7 @@ class CollectConfig:
     block_sizes: Sequence[int] = (32,)
     max_new_tokens: int = 512
     max_prompt_tokens: int = 1024
-    batch_size: int = 1
+    batch_size: int = 32
     dtype: str = "bfloat16"
     attention: str = "sdpa"
     draft_source: str = "context"

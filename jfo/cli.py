@@ -52,6 +52,7 @@ def command_collect(args: argparse.Namespace) -> None:
                 "block_sizes",
                 "max_new_tokens",
                 "max_prompt_tokens",
+                "batch_size",
                 "draft_source",
                 "shard_index",
                 "shard_count",
@@ -175,6 +176,7 @@ def build_parser() -> argparse.ArgumentParser:
     collect.add_argument("--block-sizes")
     collect.add_argument("--max-new-tokens", type=int)
     collect.add_argument("--max-prompt-tokens", type=int)
+    collect.add_argument("--batch-size", type=int)
     collect.add_argument("--draft-source", choices=["context", "vocabulary"])
     collect.add_argument("--shard-index", type=int)
     collect.add_argument("--shard-count", type=int)
